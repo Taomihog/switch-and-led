@@ -9,6 +9,7 @@
 #include <bitset>
 #include <iostream>
 #include <array>
+#include <string>
 
 #define DEBUG 1
 // define a macro to run function only in debug mode
@@ -38,18 +39,6 @@ void decode_pin(uint8_t pin, ComponentType &compType, PinType &pinType, uint8_t 
     idx = pin & 0xF;
 }
 
-// N, M, V record the number of Switches, LEDs, and Vertices respectively.
-// elements is the shuffled list of all pins. the power (+) and power (-) are on the 2 ends
-// complementElementPos records the positions of the complementary pins
-//     For LED, pin POS is complementary to pin NEG
-//     For switch, pin 0 is complementary to pin POS and pin NEG
-// dsu is the disjoint set union structure to quickly evaluate connectivity of vertices.
-struct Circuit {
-    uint8_t N, M, V;
-    const std::vector<uint8_t> pins; // size of pins = 2 + 2*M + 3*N
-    std::vector<uint8_t> complementPinPositions; //uint8_t is enough to record positions since we have at most 256 pins, it is computed at the end
-};
-
 /*
 // Enforce these structural sanity constraints. If violated, re-partition. If re-partitioning fails 100 times, restart from step 1 (re-shuffling):
 // - Constraint A: Every vertex must contain 2 or more pins (no isolated or floating single pins).
@@ -57,7 +46,8 @@ struct Circuit {
 // - Constraint C: The same LED's + and - pins, or a switch's Pin 0 and Pin 1/2, cannot be inside the same vertex (renders the component natively useless).
 // - Constraint D: An LED's + and - pins cannot span directly between the Power (+) vertex and Power (-) vertex. (This would render the LED permanently on or permanently reverse-biased/off, bypassing the switch matrix).
 // - Constraint E: A switch's Pin 0 and either Pin 1 or Pin 2 cannot span directly between the Power (+) vertex and Power (-) vertex (flipping this switch would cause a guaranteed short circuit).
-// - Constraint F: Vertex 0 Must have a switch pin connected to it, and Vertex V-1 must have a switch pin connected to it, or else the circuit is not really functional as we won't be able to control the connectivity between power rails.
+// - Constraint F: Vertices with power pins must have a switch pin connected to it, or else the circuit is not really functional as we won't be able to control the connectivity between power rails.
+// - Constraint G: Vertices cannot only contain LED pins
 */
 class CircuitGenerator {
 public:
@@ -65,19 +55,33 @@ public:
     using sp2v_t = std::array<std::array<uint8_t, 16>, 3>; // switch pin to vertex index
     using lp2v_t = std::array<std::array<uint8_t, 16>, 2>; // LED pin to vertex index
 
-    CircuitGenerator(uint8_t switches, uint8_t leds, uint8_t vertices) 
-        : N(switches), M(leds), V(vertices), pool_size(static_cast<uint8_t>(2 + 2 * leds + 3 * switches)), rng(std::random_device{}()), 
-          pool(0), wall_pool(0), parents(pool_size), switch_p2v{}, led_p2v{}, switch_p2pos{}
+    CircuitGenerator(uint8_t switches, uint8_t leds, std::vector<uint8_t> vertex_sizes) 
+        : N(switches), M(leds), V(vertex_sizes.size()), pool_size(static_cast<uint8_t>(2 + 2 * leds + 3 * switches)), rng(std::random_device{}()), 
+          pool(0), parents(pool_size), wall_positions(0), switch_p2v{}, led_p2v{}, power_p2v{}, switch_p2pos{}
     {
         assert(V >= 2); // Need at least 2 vertices to separate power rails
         assert(N < 16 && M < 16 && V < 16); // Ensure component counts are within bounds
         assert(pool_size >= static_cast<uint8_t>(V * 2)); // At least need 2 pins per vertex on average to satisfy the minimum pin count constraint
         std::cout << "Initializing Circuit Generator with " << (int)N << " switches, " << (int)M << " LEDs, and " << (int)V << " vertices. Pool size " << (int)pool_size << std::endl;
-        pool.reserve(pool_size); // Reserve space for all pins
-        wall_pool.reserve(pool_size - 3); 
 
-        // Populate all pins
-        pool.push_back(encode_pin(POWER, POS, 0)); // Power +
+        // Populate wall positions based on vertex sizes
+        int p = 0;
+        wall_positions.push_back(p);
+        for (int i =0; i < V; ++i) {
+            assert(vertex_sizes[i] >= MIN_WALL_DISTANCE); // Constraint A: Ensure minimum distance between walls to avoid isolated pins
+            p += vertex_sizes[i];
+            wall_positions.push_back(p);
+        }
+        assert(wall_positions.back() == pool_size);
+
+        // Set parent to the start of each vertex's pin list
+        for (int i = 0; i < V; ++i) {
+            for (int j = wall_positions[i]; j < wall_positions[i + 1]; ++j) {
+                parents[j] = wall_positions[i];
+            }
+        }
+
+        // Populate pin pool with encoded pin information
         for (int i = 0; i < M; ++i) {
             pool.push_back(encode_pin(LED, POS, i)); // LED +
             pool.push_back(encode_pin(LED, NEG, i)); // LED -
@@ -87,32 +91,31 @@ public:
             pool.push_back(encode_pin(SWITCH, NEG, i)); // Switch Pin 1
             pool.push_back(encode_pin(SWITCH, COM, i)); // Switch Pin 2
         }
+        pool.push_back(encode_pin(POWER, POS, 0)); // Power +
         pool.push_back(encode_pin(POWER, NEG, 0)); // Power -
         assert(pool.size() == pool_size);
 
-        for (uint8_t pos = 1; pos < pool_size - 2; ++pos) {
-            wall_pool.push_back(pos);
-        }
+
     }
 
-    std::tuple<const std::vector<uint8_t>*, const std::vector<uint8_t>*, const sp2v_t*> generate() {
+    std::tuple<const std::vector<uint8_t>*, const sp2v_t*> generate() {
         stats_total_trys = 0;
         stats_total_accepted = 0;
 
         while (stats_total_trys < 10000) {
             ++stats_total_trys;
-            std::shuffle(pool.begin() + 1, pool.end() - 1, rng);
+            std::shuffle(pool.begin(), pool.end(), rng);
 
             // One-pass fill in the vertex index for each switch and LED pin
             for (int i = 0; i < V; ++i) {
-                int start = (i == 0) ? 0 : wall_pool[i - 1] + 1;
-                int end = (i == V - 1) ? pool_size : wall_pool[i] + 1;
-                for (int j = start; j < end; ++j) {
+                for (int j = wall_positions[i]; j < wall_positions[i + 1]; ++j) {
                     uint8_t pin = pool[j];
                     if (pin >> 6 == SWITCH) {
                         switch_p2v[(pin >> 4) & 0x3][pin & 0xF] = i;
                     } else if (pin >> 6 == LED) {
                         led_p2v[(pin >> 4) & 0x3][pin & 0xF] = i;
+                    } else {
+                        power_p2v[(pin >> 4) & 0x1] = i; // power pin, either + or -
                     }
                 }
             }
@@ -131,17 +134,23 @@ public:
             // std::cout << std::endl << std::endl;
 
             bool constraint_violated = false;
-            for (int i = 0; i < N; ++i) { // constraint C and E evaluation for switches
+            // Constraint B: A vertex cannot contain BOTH the Power (+) and Power (-) poles (instant hard short circuit).
+            if (power_p2v[POS] == power_p2v[NEG]) {
+                constraint_violated = true;
+            }
+
+            // Constraint C, D, E: Evaluate switch and LED pin placements for invalid configurations
+            for (int i = 0; i < N && !constraint_violated; ++i) { // constraint C and E evaluation for switches
                 if (switch_p2v[POS][i] == switch_p2v[NEG][i] || 
                     switch_p2v[COM][i] == switch_p2v[POS][i] || 
                     switch_p2v[COM][i] == switch_p2v[NEG][i]) {
                     constraint_violated = true;
                     break;
                 }
-                if ((switch_p2v[COM][i] == 0 && switch_p2v[NEG][i] == V - 1) || 
-                    (switch_p2v[COM][i] == 0 && switch_p2v[POS][i] == V - 1) || 
-                    (switch_p2v[NEG][i] == 0 && switch_p2v[COM][i] == V - 1) || 
-                    (switch_p2v[POS][i] == 0 && switch_p2v[COM][i] == V - 1)) {
+                if ((switch_p2v[COM][i] == power_p2v[POS] && switch_p2v[NEG][i] == power_p2v[NEG]) || 
+                    (switch_p2v[COM][i] == power_p2v[POS] && switch_p2v[POS][i] == power_p2v[NEG]) || 
+                    (switch_p2v[COM][i] == power_p2v[NEG] && switch_p2v[NEG][i] == power_p2v[POS]) || 
+                    (switch_p2v[COM][i] == power_p2v[NEG] && switch_p2v[POS][i] == power_p2v[POS])) {
                     constraint_violated = true;
                     break;
                 }
@@ -151,51 +160,67 @@ public:
                     constraint_violated = true;
                     break;
                 }
-                if ((led_p2v[POS][i] == 0 && led_p2v[NEG][i] == V - 1) || 
-                    (led_p2v[NEG][i] == 0 && led_p2v[POS][i] == V - 1)) {
+                if ((led_p2v[POS][i] == power_p2v[POS] && led_p2v[NEG][i] == power_p2v[NEG]) || 
+                    (led_p2v[NEG][i] == power_p2v[NEG] && led_p2v[POS][i] == power_p2v[POS])) {
                     constraint_violated = true;
                     break;
                 }
             }
-            bool vertex_0_has_switch = false;
-            bool vertex_v1_has_switch = false;
-            for (int i = 0; i < N && !constraint_violated; ++i) { // constraint F evaluation
-                if (switch_p2v[COM][i] == 0) {
-                    vertex_0_has_switch = true;
+
+            // Constraint F: Vertices with power pins must have a switch pin connected to it, or else the circuit is not really functional as we won't be able to control the connectivity between power rails.
+            bool power_pos_has_switch = false;
+            bool power_neg_has_switch = false;
+            for (int i = 0; i < N && !constraint_violated; ++i) {
+                if (!power_pos_has_switch && (switch_p2v[POS][i] == power_p2v[POS] || switch_p2v[NEG][i] == power_p2v[POS] || switch_p2v[COM][i] == power_p2v[POS])) {
+                    power_pos_has_switch = true;
                 }
-                if (switch_p2v[COM][i] == V - 1) {
-                    vertex_v1_has_switch = true;
+                if (!power_neg_has_switch && (switch_p2v[POS][i] == power_p2v[NEG] || switch_p2v[NEG][i] == power_p2v[NEG] || switch_p2v[COM][i] == power_p2v[NEG])) {
+                    power_neg_has_switch = true;
                 }
             }
-            if (!vertex_0_has_switch || !vertex_v1_has_switch) {
+            if (!power_pos_has_switch || !power_neg_has_switch) {
                 constraint_violated = true;
             }
+
+            // Constraint G: Vertices cannot only contain LED pins
+            for (int i = 0; i < V && !constraint_violated; ++i) {
+                bool has_non_led_pin = false;
+                for (int j = wall_positions[i]; j < wall_positions[i + 1]; ++j) {
+                    uint8_t pin = pool[j];
+                    if (pin >> 6 == SWITCH || pin >> 6 == POWER) {
+                        has_non_led_pin = true;
+                    }
+                    if (has_non_led_pin) break;
+                }
+                if (!has_non_led_pin) {
+                    constraint_violated = true;
+                    break;
+                }
+            }
+
             if (constraint_violated) {
                 continue;
             }
             ++stats_total_accepted;
             // good, we generate a valid circuit!
             
-            DSU_uint8 dsu(pool_size);
             // Sort each vertex, set DSU's parent to the start of each vertex's pin list, and fill in the switch_p2pos for quick complementary pin lookup during simulation
             for (int i = 0; i < V; ++i) {
-                int start = (i == 0) ? 0 : wall_pool[i - 1] + 1;
-                int end = (i == V - 1) ? pool_size : wall_pool[i] + 1;
-                std::sort(pool.begin() + start, pool.begin() + end); // sort the pins within each vertex for easier constraint evaluation
-                for (int j = start; j < end; ++j) {
-                    parents[j] = start;
+                std::sort(pool.begin() + wall_positions[i], pool.begin() + wall_positions[i + 1]); // sort the pins within each vertex for easier constraint evaluation
+                for (int j = wall_positions[i]; j < wall_positions[i + 1]; ++j) {
+                    parents[j] = wall_positions[i];
                     if (pool[j] >> 6 == SWITCH) {
                         switch_p2pos[(pool[j] >> 4) & 0x3][pool[j] & 0xF] = j;
                     }
                 }
             }
-            return {&pool, &parents, &switch_p2pos};
+            return {&pool, &switch_p2pos};
         }
         std::cerr << "Failed to generate a valid circuit after " << stats_total_trys << " tries " << std::endl;
-        return {nullptr, nullptr, nullptr};
+        return {nullptr, nullptr};
     }
 
-    v2p_t print_current_configuration() {
+    void print_current_configuration() {
         std::cout << "Current Circuit Configuration" << std::endl;
         std::cout << "Total tries: " << stats_total_trys << ", Total accepted: " << stats_total_accepted << std::endl;
         // print p2v
@@ -221,38 +246,61 @@ public:
         std::cout << "\nPinCom "; for (int i = 0; i < N; ++i) printf("%2d ", (int)switch_p2pos[COM][i]);
         std::cout << std::endl;
 
-        // fill v2p and print out
-        v2p_t v2p{};
+        std::cout << get_v2p_string(get_v2p()) << std::endl;
+    }
+
+    const v2p_t& get_v2p() {
         for (int i = 0; i < V; ++i) {
-            int start = (i == 0) ? 0 : wall_pool[i - 1] + 1;
-            int end = (i == V - 1) ? pool_size : wall_pool[i] + 1;
             v2p[i].first = 0;
-            for (int j = start; j < end; ++j) {
+            for (int j = wall_positions[i]; j < wall_positions[i + 1]; ++j) {
                 v2p[i].second[v2p[i].first++] = pool[j];
             }
         }
-        print_v2p(v2p);
         return v2p;
     }
 
-    static void print_v2p(const v2p_t& v2p) {
-        std::cout << "\nVertex to Pin Mapping:";
+    const std::vector<uint8_t>& get_parents() const {
+        return parents;
+    }
+
+    static std::string get_v2p_string(const v2p_t& v2p) {
+        std::string result = "v2p:";
         for (int i = 0; i < v2p.size(); ++i) {
             if (v2p[i].first == 0) continue; // skip empty vertices
-            std::cout << "\nVertex " << i << ": ";
+            result += "[" + std::to_string(i) + "]";
             for (int j = 0; j < v2p[i].first; ++j) {
                 uint8_t pin = v2p[i].second[j];
                 ComponentType compType;
                 PinType pinType;
                 uint8_t idx;
                 decode_pin(pin, compType, pinType, idx);
-                printf("(%c%c%d) ", (compType == POWER) ? 'P' : (compType == LED) ? 'L' : 'S', 
-                                    (pinType == POS) ? '+' : (pinType == NEG) ? '-' : '@', 
-                                    idx);
+                result += "(" + std::string(1, (compType == POWER) ? 'P' : (compType == LED) ? 'L' : 'S') +
+                          std::string(1, (pinType == POS) ? '+' : (pinType == NEG) ? '-' : '@') +
+                          std::to_string(idx) + ")";
             }
         }
-        std::cout << std::endl;
+        return result;
     }
+
+    static std::string get_vp2_oneline_string(const v2p_t& v2p) {
+        std::string result = "v2p:";
+        for (int i = 0; i < v2p.size(); ++i) {
+            if (v2p[i].first == 0) continue; // skip empty vertices
+            result += "[" + std::to_string(i) + "]";
+            for (int j = 0; j < v2p[i].first; ++j) {
+                uint8_t pin = v2p[i].second[j];
+                ComponentType compType;
+                PinType pinType;
+                uint8_t idx;
+                decode_pin(pin, compType, pinType, idx);
+                result += "(" + std::string(1, (compType == POWER) ? 'P' : (compType == LED) ? 'L' : 'S') +
+                          std::string(1, (pinType == POS) ? '+' : (pinType == NEG) ? '-' : '@') +
+                          std::to_string(idx) + ")";
+            }
+            result += ",";
+        }
+        return result;
+    }   
 
 private:
     static constexpr uint8_t MIN_WALL_DISTANCE = 2; // Minimum distance between walls to ensure no vertex is completely isolated
@@ -260,33 +308,17 @@ private:
     std::mt19937 rng; 
     std::vector<uint8_t> pool;
     std::vector<uint8_t> parents;
-    std::vector<uint8_t> wall_pool;
+    std::vector<uint8_t> wall_positions;
 
     // Map from pin to vertex index for quick constraint evaluation
     sp2v_t switch_p2v; // the switch's pin belong to which vertex, used to evaluate constraint C and E
     lp2v_t led_p2v; // the LED's pin belong to which vertex, used to evaluate constraint C and D
+    std::array<uint8_t, 2> power_p2v; // the power pins belong to which vertex, used to evaluate constraint B
     sp2v_t switch_p2pos; // the switch's pin position in the pool, used to quickly find the complementary pin position for constraint evaluation
+    v2p_t v2p; // auxiliary structure to store vertex to pin mapping for quick lookup during simulation
 
     // counters for print_current_configuration()
     int stats_total_trys = 0;
     int stats_total_accepted = 0;
-
-    size_t generate_walls_obselete() {
-        uint8_t min_wall_distance = 0;
-        size_t tries = 0;
-        // - Constraint A: Every vertex must contain 2 or more pins (no isolated or floating single pins).
-        while (min_wall_distance < MIN_WALL_DISTANCE) { 
-            ++tries;
-            min_wall_distance = 0xFF;
-            std::shuffle(wall_pool.begin(), wall_pool.end(), rng);
-            std::sort(wall_pool.begin(), wall_pool.begin() + V - 1); 
-            // std::cout << "Wall positions: "; for (int i = 0; i < V - 1; ++i) printf("%2d ", wall_pool[i]); std::cout << std::endl;
-            for (int i = 0; i < V - 2; ++i) {
-                uint8_t distance = wall_pool[i + 1] - wall_pool[i];
-                min_wall_distance = std::min(min_wall_distance, distance);
-            }
-        }
-        return tries;
-    }
 
 };
