@@ -31,8 +31,6 @@ void debug_print(const std::string& msg) {
     }
 }
 
-using data_t = std::tuple<std::vector<uint8_t>, std::string, SwitchBlackbox::statistics>;
-
 struct opt_t {
     bool save_stats = true;
     int num_workers = 4;
@@ -49,95 +47,60 @@ int main() {
     // single worker test
    
     uint8_t N = 5; // Switches
-    uint8_t M = 9; // Outputs
+    uint8_t M = 8; // Outputs
     uint8_t V = 15; // Vertices
     SwitchBlackbox sbb(N, M, V);
-    do
-    {
-        sbb.generate();
-    } while (sbb.unique_vertices_no_less_than_m());
-    sbb.best_choice_of_m_vertices();
-     
-}
-#if 0
-int main2() {
-    const opt_t opt;
-    ThreadSafeQueue<data_t> queue;
-    std::atomic<bool> workers_running{true};
+    int cnt = 0;
+    uint32_t max_dist_adj = 0;
+    uint32_t max_dist_2 = 0;
+    int min_stdev = INT_MAX;
+    int max_n1s = 0;
+    while (cnt < 20000) {
+        SwitchBlackbox::Statistics s;
+        do
+        {
+            sbb.generate();
+            s = sbb.basic_stats();
+        } while (s.max_reachable_n < M);
+        int n_unique = sbb.best_choice_of_m_vertices();
+        if (n_unique == 1 << N) {
+            auto dist_1 = sbb.sum_reachable_distance_for_adjacent_bitmasks(1, V);
+            auto dist_2 = sbb.sum_reachable_distance_for_adjacent_bitmasks(2, V);
+            auto n1s = sbb.n_1s();
+            auto stdev = sbb.stdev();
 
-    // 1. Launch the Writer (Consumer) Thread
-    std::jthread writer_thread([&queue, &opt]() {
-        std::ofstream bf(opt.bin_filename);
-        if (!bf.is_open()) {
-            std::cerr << "Error: Could not open bin file.\n";
-            return;
-        }
-        std::ofstream hf(opt.human_readable_filename);
-        if (!hf.is_open()) {
-            std::cerr << "Error: Could not open human readable data file.\n";
-            return;
-        }
-        std::ofstream sf(opt.stats_filename);
-        if (!sf.is_open()) {
-            std::cerr << "Error: Could not open statistics file.\n";
-            return;
-        }
-
-        while (true) {
-            auto [serialized_data, readable_data, stats] = queue.pop_blocking();
-
-            // Sentinel check ("Poison Pill"): Stop signal received
-            if (serialized_data.size() == 0) {
-                break;
+            bool good = false;
+            if (dist_2 > max_dist_2) {
+                good = true;
+                max_dist_2 = dist_2;
+            }
+            if (dist_1 > max_dist_adj) {
+                good = true;
+                max_dist_adj = dist_1;
+            }
+            if (n1s > max_n1s) {
+                good = true; 
+                max_n1s = n1s;
+            }
+            if (stdev < min_stdev || stdev == 0) {
+                good = true;
+                min_stdev = stdev;
             }
 
-        }
-        
-        std::cout << "Writer thread: Queue drained and file safely closed.\n";
-    });
+            if (good) {
+                std::string config = sbb.get_readable_config();
+                std::cout << "Unique config: " << n_unique << ", config: " << config;
+                std::cout << "distance 1: " << dist_1 << ", distance 2: " << dist_2 << ", n1s:" << n1s << ", stdev: " << stdev << std::endl;
 
-    // 2. Launch N Worker (Producer) Threads
-    std::vector<std::jthread> worker_threads;
-    worker_threads.reserve(opt.num_workers);
-
-    for (int i = 0; i < opt.num_workers; ++i) {
-        worker_threads.emplace_back([&queue, &workers_running, &opt](int id) {
-            int counter = 0;
-                SwitchBlackbox generator(opt.N, opt.M, opt.V);
-            while (workers_running.load(std::memory_order_relaxed)) {
-                // Simulate data generation
-                do {
-                    generator.generate();
-                } while (!generator.check());
-
-
-                queue.push(data_t{id, ++counter});
-                
-                // Slow down workers slightly to prevent instant memory bloating
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                // test load function
+                sbb.generate(sbb.get_readable_config());
+                if (config != sbb.get_readable_config()) {
+                    std::cerr << "error!" << std::endl;
+                }
             }
-            std::cout << "Worker " << id << " has finished producing.\n";
-        }, i);
+            
+            ++cnt;
+        }
     }
-
-    // 3. Main thread runs the application pipeline duration
-    std::cout << "Application running. Workers generating data...\n";
-    std::this_thread::sleep_for(std::chrono::seconds(3)); 
-
-    // 4. Orderly Shutdown Sequence
-    std::cout << "\nInitiating shutdown sequence...\n";
-    
-    // Step A: Tell workers to break their loops
-    workers_running.store(false, std::memory_order_relaxed);
-
-    // Step B: Wait for all workers to join (guarantees no more real data is added)
-    worker_threads.clear(); 
-    std::cout << "All workers joined.\n";
-
-    // Step C: Push the sentinel value to unlock and terminate the writer thread
-    queue.push(data_t{{}, "", {}});
-
-    // Step D: The writer_thread will automatically join here as it falls out of scope
     return 0;
 }
-#endif

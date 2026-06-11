@@ -16,6 +16,7 @@
 #include <bit>
 
 #include "DSU_uint8.hpp"
+#include "utils.hpp"
 
 #define DEBUG 1
 // define a macro to run function only in debug mode
@@ -36,32 +37,26 @@ public:
     using v2p_t = std::array<std::pair<uint8_t, std::array<uint8_t, 0xFF>>, 16>; // vertex index -> a list of pins
     using p2v_t = std::array<uint8_t, 0xFF>; // switch pin to vertex index
     using rsa_t = std::vector<std::pair<uint64_t, uint16_t>>; //reachable_switch_array type
+    bool verbose = false;
+    size_t total_generate_counter = 0;
 
     static constexpr size_t HISTO_SIZE = 100;
-    struct statistics {
-        size_t total_generate_counter;
-        size_t total_check_pass_counter;
-        // histogram
-        std::array<size_t, HISTO_SIZE> hist_max_reachable_n;
-        std::array<size_t, HISTO_SIZE> hist_n_never_reached; // = V - (std::bitset<64>(all_reachable_bitset)).count(); 
-        std::array<size_t, HISTO_SIZE> hist_n_unique_configs1; // = static_cast<uint8_t>(reachable_switch_array.size());
-        std::array<size_t, HISTO_SIZE> hist_n_unique_configs2; // = static_cast<uint8_t>(reachable_switch_array.size());
-        std::array<size_t, HISTO_SIZE> hist_n_unique_configs3; // = static_cast<uint8_t>(reachable_switch_array.size());
-        // arrays
-        std::vector<uint8_t>  arr_max_reachable_n;
-        std::vector<uint8_t>  arr_n_never_reached;
-        std::vector<uint16_t> arr_n_unique_configs1;
-        std::vector<uint16_t> arr_n_unique_configs2;
-        std::vector<uint16_t> arr_n_unique_configs3;
-    } stats;
+    struct Statistics {
+        uint8_t N = 0;
+        uint8_t M = 0;
+        uint8_t V = 0;
+        uint8_t pool_size = 0;
+        uint64_t hash = 0; 
+        uint64_t all_reachable_bitset = 0ULL;
+        uint8_t  max_reachable_n = 0;
+        uint16_t max_reachable_bitmask = 0;
+        uint64_t max_reachable_bitset = 0;
+        uint8_t n_never_reached = 0; 
+        uint16_t n_unique_configs = 0;
+        size_t total_generate_counter = 0;
+    };
 
-    statistics get_stats_then_reset() {
-        statistics stats_out = stats;
-        stats = {};
-        return stats_out;
-    }
-
-    std::string get_readable_config() {
+    std::string get_readable_config(bool single_line = true) const {
         std::stringstream ss;
         // print all pins in pool
         auto pin2string = [](uint8_t pin) -> std::string {
@@ -71,20 +66,84 @@ public:
             char pinChar = (pinType == Pin1) ? 'a' : (pinType == Pin2) ? 'b' : 'c';
             return std::to_string(idx) + poleChar + pinChar;
         };
-        for (int i = 0; i < pool.size(); ++i) {
-            uint8_t pin = pool[i];
-            ss << pin2string(pin) << " ";
-            if (i+ 1 < pool.size()) {
-                if (pos2vertex[i] != pos2vertex[i + 1]) ss << "| ";
+        if (single_line) {
+            
+            for (size_t i = 0; i < pool.size(); ++i) {
+                uint8_t pin = pool[i];
+                ss << pin2string(pin) << " ";
+                if (i < pool.size() - 1) {
+                    if (pos2vertex[i] != pos2vertex[i + 1]) ss << "| ";
+                }
+            }
+            ss << std::endl;
+        } else {
+            ss << "pins in pool:      ";
+            for (size_t i = 0; i < pool.size(); ++i) {
+                uint8_t pin = pool[i];
+                ss << pin2string(pin) << " ";
+            }
+            ss << std::endl;
+            ss << "pins in vertices: ";
+            for (size_t i = 0; i < pool.size(); ++i) {
+                printf(" %2d ", pos2vertex[i]);
             }
         }
-        ss << std::endl;
         return ss.str();
+    }
+
+    const rsa_t& get_reachable_switch_array() const {
+        return reachable_switch_array;
+    }
+
+    // Sum of distances between reachables for all pairs of bitmasks that differ by exactly dist bit (adjacent in Hamming space)
+    uint32_t sum_reachable_distance_for_adjacent_bitmasks(int dist, int N) const {
+        std::map<uint16_t, uint64_t> bitmask_to_reachable;
+        for (const auto& [reachable, bitmask] : reachable_switch_array) {
+            bitmask_to_reachable[bitmask] = reachable;
+        }
+        
+        uint32_t total_distance = 0;
+        const auto& bitmasks = bitmask_to_reachable;
+        for (auto it1 = bitmasks.begin(); it1 != bitmasks.end(); ++it1) {
+            for (auto it2 = std::next(it1); it2 != bitmasks.end(); ++it2) {
+                uint16_t xor_val = it1->first ^ it2->first;
+                if (std::popcount(static_cast<uint32_t>(xor_val)) == dist) {
+                    total_distance += reachable_distance(it1->second, it2->second, N);
+                }
+            }
+        }
+        return total_distance;
+    }
+
+    int stdev() {
+        std::vector<int> bitCounts(64, 0);
+        for (const auto& [r, b] : reachable_switch_array) {
+            for (int i = 0; i < 64; ++i) {
+                if ((r >> i) & 1) {
+                    bitCounts[i]++;
+                }
+            }
+        }
+        int sum = 0;
+        int square_sum = 0;
+        for (const auto c : bitCounts) {
+            sum += c;
+            square_sum += c * c;
+        }
+        return 64 * square_sum - sum * sum ;
+    }
+
+    int n_1s() {
+        int n1s = 0;
+        for (const auto& [r, b] : reachable_switch_array) {
+            n1s += std::popcount(r);
+        }
+        return n1s;
     }
 
     SwitchBlackbox(uint8_t n_switches, uint8_t n_outputs, uint8_t n_vertices):
         N(n_switches), M(n_outputs), V(n_vertices), rng(std::random_device{}()), pool_size(static_cast<uint8_t>(1 + 6 * n_switches)), 
-        pool(), wall_pool(), stats{}
+        pool(), wall_pool()
     {
         assert(N < 16 && M < 16 && V < 64); // Ensure component counts are within bounds, V < 64 because reachable is a uint64_t mask 
         for(int i = 0; i < N; ++i) {
@@ -99,10 +158,10 @@ public:
         for(int i = 1; i < pool_size; ++i) {
             wall_pool.push_back(i);
         }
-        assert(wall_pool.size() == pool_size - 1);
+        assert(wall_pool.size() == size_t (pool_size - 1));
     }
 
-    void generate() {
+    void generate(std::string s = "") {
         // step 1. generate circuit
         std::vector<uint8_t> vertex_sizes(V); 
         std::vector<uint8_t> parents(pool_size); // DSU parent array for connectivity simulation
@@ -111,8 +170,14 @@ public:
         uint8_t input_pos; // position of the power INPUT pin in the pool
         uint8_t input_vertex; // vertex index of the power INPUT pin, used to quickly check if an output is powered in the simulation
         while (true) {
-            ++stats.total_generate_counter;
-            update_pools(true);
+            ++total_generate_counter;
+            if (!s.length()) { // generate a random pool and wall_pool
+                std::shuffle(pool.begin(), pool.end(), rng);
+                std::shuffle(wall_pool.begin() , wall_pool.end(), rng);
+                std::sort(wall_pool.begin(), wall_pool.begin() + V - 1); // Sort wall_pool[0] through wall_pool[V-2] (the V-1 internal walls we use)
+            } else { // load pool and wall_pool
+                update_pools(s);
+            }
             // build position -> vertex mapping while keeping parents as DSU start indices
             pos2vertex.assign(pool_size, 0);
             for (int i = 0; i < V; ++i) {
@@ -127,7 +192,7 @@ public:
             }
 
             // one-pass to fill out input_pos, input_vertex, p2pos and p2v for quick constraint evaluation and simulation later
-            for (int i = 0; i < pool.size(); ++i) {
+            for (size_t i = 0; i < pool.size(); ++i) {
                 uint8_t pin = pool[i];
                 if (pin == INPUT) {
                     input_pos = static_cast<uint8_t>(i);
@@ -154,7 +219,7 @@ public:
             // the original vertices united with the INPUT vertex are set to 1, other vertices are 0
             const uint8_t input_root = dsu.find(input_pos);
             uint64_t reachable_bitset = 0ULL;
-            for (int i = 0; i < pool.size(); ++i) {
+            for (size_t i = 0; i < pool.size(); ++i) {
                 if (dsu.find(i) == input_root) {
                     auto pin = pool[i];
                     if (pin == INPUT) continue;
@@ -167,8 +232,8 @@ public:
         }
     }
 
-    bool unique_vertices_no_less_than_m() {
-        // how many unique reachable pattern
+    Statistics basic_stats() {
+        // remove duplicates from rsa
         std::sort(reachable_switch_array.begin(), reachable_switch_array.end(), [](const auto& a, const auto& b) {
             if (a.first == b.first) return a.second < b.second;
             return a.first < b.first;
@@ -177,13 +242,24 @@ public:
             return a.first == b.first;
         }); 
         reachable_switch_array.erase(new_end, reachable_switch_array.end());
-
-        uint64_t all_reachable_bitset = 0ULL; // union of outputs reachable by any switch configuration
-        uint8_t  max_reachable_n = 0;
-        uint16_t max_reachable_bitmask = 0;
-        uint64_t max_reachable_bitset = 0;
+        Statistics stats {};
+        stats.N = N;
+        stats.M = M;
+        stats.V = V;
+        stats.pool_size = pool_size;
+        uint64_t& hash = stats.hash;
+        // 64-bit FNV-1a offset basis
+        hash = 0xcbf29ce484222325ULL; 
+        // 64-bit FNV-1a prime
+        const uint64_t fnv_prime = 0x100000001b3ULL; 
+        uint64_t& all_reachable_bitset = stats.all_reachable_bitset; // union of outputs reachable by any switch configuration
+        uint8_t&  max_reachable_n = stats.max_reachable_n;
+        uint16_t& max_reachable_bitmask = stats.max_reachable_bitmask;
+        uint64_t& max_reachable_bitset = stats.max_reachable_bitset;
         for(const auto&[r,m] : reachable_switch_array) {
             all_reachable_bitset |= r;
+            hash ^= r;
+            hash *= fnv_prime;
             uint8_t cnt = static_cast<uint8_t>((std::bitset<64>(r)).count());
             if (cnt > max_reachable_n) {
                 max_reachable_n = cnt;
@@ -191,57 +267,27 @@ public:
                 max_reachable_bitset = r;
             }
         }
-        const uint8_t n_never_reached = V - (std::bitset<64>(all_reachable_bitset)).count(); 
-        const uint16_t n_unique_configs = static_cast<uint16_t>(reachable_switch_array.size());//bitmask size < 1<<16        //print
+        hash ^= (hash >> 33);
+        hash *= 0xff51afd7ed558ccdULL;
+        hash ^= (hash >> 33);
+        stats.n_never_reached = V - (std::bitset<64>(all_reachable_bitset)).count(); 
+        stats.n_unique_configs = static_cast<uint16_t>(reachable_switch_array.size());
+        stats.total_generate_counter = total_generate_counter;
+        total_generate_counter = 0; //reset counter
 
-        std::cout << "============================================================Unique Vertices >= M, Config=============================================================";
-        std::cout << std::endl;
-        std::cout << "#switch N: " << (int)N << std::endl;
-        std::cout << "#output M: " << (int)M << std::endl;
-        std::cout << "#vertex V: " << (int)V << std::endl;
-        std::cout << "pool size: " << (int)pool_size << std::endl << std::endl;
-        std::cout << "Total tries: " << stats.total_generate_counter << std::endl;
-        std::cout << "Unique configurations: " << (int)n_unique_configs << " (" << (1<<N - (int)n_unique_configs) << " removed)" << std::endl;
-        std::cout << "All reachable bitset: " << mask2string(all_reachable_bitset, V) << std::endl;
-        std::cout << "Never reached outputs: " << (int)n_never_reached << std::endl;
-        std::cout << "Max reachable outputs: " << (int)max_reachable_n << std::endl;
-        std::cout << "bitmask|reachable: " << mask2string(max_reachable_bitmask, N) << "|" << mask2string(max_reachable_bitset, V) << std::endl;
-        std::cout << "vertices_max_reachable_pattern_can_reach size (for heuristic selection): ";
-        for(auto&[reachable, bitmask] : reachable_switch_array) {
-            std::cout << "bitmask|reachable: " << mask2string(bitmask, N) << "|" << mask2string(reachable, V) << std::endl;
-        }
-        std::cout << "Vertex and pins \n";
-        // print all pins in pool
-        auto pin2string = [](uint8_t pin) -> std::string {
-            if (pin == INPUT) return "Inp";
-            auto [poleType, pinType, idx] = decode_pin(pin);
-            char poleChar = (poleType == Pole1) ? 'A' : 'B';
-            char pinChar = (pinType == Pin1) ? 'a' : (pinType == Pin2) ? 'b' : 'c';
-            return std::to_string(idx) + poleChar + pinChar;
-        };
-        std::cout << "pins in pool:      ";
-        for (int i = 0; i < pool.size(); ++i) {
-            uint8_t pin = pool[i];
-            std::cout << pin2string(pin) << " ";
-        }
-        std::cout << std::endl;
-        std::cout << "pins in vertices: ";
-        for (int i = 0; i < pool.size(); ++i) {
-            printf(" %2d ", pos2vertex[i]);
-        }
-        std::cout << std::endl;
-        std::cout << "test: " << get_readable_config();
-        std::cout << std::endl;
-        std::cout << "=====================================================================================================================================================" << std::endl << std::endl;
+        if (verbose) {
+            print_stats(stats);
 
-        ++stats.total_check_pass_counter;
-        ++stats.hist_max_reachable_n[max_reachable_n];                  stats.arr_max_reachable_n.push_back(max_reachable_n);
-        ++stats.hist_n_never_reached[n_never_reached];                  stats.arr_n_never_reached.push_back(n_never_reached);
-        ++stats.hist_n_unique_configs1[n_unique_configs];               stats.arr_n_unique_configs1.push_back(n_unique_configs);
-        return max_reachable_n >= M;
+            for(auto&[r, b] : reachable_switch_array) {
+                std::cout << "bitmask|reachable: " << mask2string(b, N) << "|" << mask2string(r, V) << std::endl;
+            }
+
+            std::cout << "Config: " << get_readable_config() << std::endl;
+        }
+        return stats;
     }
 
-    void best_choice_of_m_vertices() {
+    int best_choice_of_m_vertices() {
         const auto& ori_arr = reachable_switch_array;
         int max_unique_rows = 0;
         std::vector<uint64_t> best_removal_masks {};
@@ -249,7 +295,7 @@ public:
             const int nbit1 = std::popcount(reachable);
             if (nbit1 < M) continue;
 
-            std::cout << "mask: " << mask2string(bitmask, N) << std::endl;
+            // std::cout << "mask: " << mask2string(bitmask, N) << std::endl;
 
             // bit 1 positions
             std::vector<int> positions;
@@ -261,10 +307,10 @@ public:
                 // Clear the lowest set bit using Brian Kernighan's trick
                 reachable &= (reachable - 1); 
             }
-            assert(nbit1 == positions.size());
+            assert(nbit1 == (int) positions.size());
 
-            std::cout << "Shrink the size of reachable from V to nbit1:" << std::endl;
-            rsa_t new_arr{}; 
+            // std::cout << "Shrink the size of reachable from V to nbit1:" << std::endl;
+            std::vector<uint64_t> new_arr{}; 
             for(const auto&[reachable, bitmask] : ori_arr) {
                 uint64_t new_reachable = 0;
                 int bit = 0;
@@ -272,30 +318,24 @@ public:
                     new_reachable |= ((reachable >> v) & 1ULL) << bit;
                     bit++;
                 }
-                new_arr.emplace_back(new_reachable, bitmask);
-                std::cout << "bitmask|reachable: " << mask2string(bitmask, N) << "|" << mask2string(reachable, nbit1) << std::endl;
+                new_arr.emplace_back(new_reachable);
+                // std::cout << "bitmask|reachable: " << mask2string(bitmask, N) << "|" << mask2string(reachable, nbit1) << std::endl;
             }
-
-            std::sort(new_arr.begin(), new_arr.end(), [](const auto& a, const auto& b) {
-                if (a.first == b.first) return a.second < b.second;
-                return a.first < b.first;
-            });
-            auto new_end = std::unique(new_arr.begin(), new_arr.end(), [](const auto& a, const auto& b) {
-                return a.first == b.first;
-            }); 
-            new_arr.erase(new_end, new_arr.end());
             
-            std::cout << "\nAfter removing duplicates, unique configurations: " << (int)new_arr.size() << std::endl;
-            std::cout << std::endl;
-            for(const auto&[reachable, bitmask] : new_arr) {
-                std::cout << "bitmask|reachable: " << mask2string(bitmask, N) << "|" << mask2string(reachable, nbit1) << std::endl;
-            }
 
             auto [nrow, masks] = findBestColumnRemoval(new_arr, nbit1, nbit1 - M);
-            // conver the best_removal_masks to the real best_removal masks before shrinking
+
+            // std::cout << "After remove cols and keep M cols, the max unique row number: " << nrow << std::endl;
+            // std::cout << "best masks (to remove):" << std::endl;
+            // for(auto m : masks) {
+            //     std::cout << mask2string(m, nbit1) << std::endl;
+            // }
+            // std::cout << std::endl;
+
+            // convert the best_removal_masks to the real best_removal masks before shrinking
             for(uint64_t &mask: masks) {
                 auto old = mask;
-                old = ~old; // best keep mask;
+                old = (~old) & ((nbit1 >= 64) ? ~0ULL : ((1ULL << nbit1) - 1)); // best keep mask within the nbit1 range
                 assert(std::popcount(old) == M);
                 mask = 0;
                 while (old > 0) {
@@ -316,16 +356,17 @@ public:
                 best_removal_masks.insert(best_removal_masks.end(), masks.begin(), masks.end());
             }
         }
-        // update the vertices_max_reachable_pattern_can_reach
-        std::cout << "\nAfter selecting the best M output from the max reachable bitset, unique configurations: " << max_unique_rows << std::endl;
-        std::cout << "Best removal mask(s): " << std::endl;
-        for (auto mask : best_removal_masks) {
-            std::cout << mask2string(mask, V) << std::endl;
-        }
-        ++stats.hist_n_unique_configs2[max_unique_rows];          stats.arr_n_unique_configs2.push_back(max_unique_rows);
-    }
 
-    void find_max_entropy_unique_ros() {};
+        if (verbose){
+            std::cout << "\nAfter selecting the best M output from the max reachable bitset, unique configurations: " << max_unique_rows << std::endl;
+            std::cout << "Best keep mask(s) (" << best_removal_masks.size() << "): " << std::endl;
+            for (auto mask : best_removal_masks) {
+                std::cout << mask2string(mask, V) << std::endl;
+            }
+        }
+
+        return max_unique_rows;
+    }
 
 private:
     // 1. constants
@@ -346,25 +387,80 @@ private:
     uint8_t best_unique_config = 0;
 
     // uint8_t is enough, the simulation will for sure use less than 16 switches and 16 LEDs, and we can encode the component type and pin type in the upper bits.
-    static uint8_t encode_pin(PoleType poleType, PinType pinType, uint8_t idx) {
-        assert (idx < 16);
-        return (poleType << 6) | (pinType << 4) | idx;
-    }
+    static uint8_t encode_pin(PoleType poleType, PinType pinType, uint8_t idx) { return idx < 16 ? (poleType << 6) | (pinType << 4) | idx : SPECIAL;}
+    static std::tuple<PoleType, PinType, uint8_t> decode_pin(uint8_t pin) { return std::make_tuple(static_cast<PoleType>(pin >> 6), static_cast<PinType>((pin >> 4) & 0x3), pin & 0xF);}
 
-    static std::tuple<PoleType, PinType, uint8_t> decode_pin(uint8_t pin) {
-        PoleType poleType = static_cast<PoleType>(pin >> 6);
-        PinType pinType = static_cast<PinType>((pin >> 4) & 0x3);
-        uint8_t idx = pin & 0xF;
-        return std::make_tuple(poleType, pinType, idx);
-    }
-
-    void update_pools(bool method) {
-        if (method) {
-            std::shuffle(pool.begin(), pool.end(), rng);
-            std::shuffle(wall_pool.begin() , wall_pool.end(), rng);
-            std::sort(wall_pool.begin(), wall_pool.begin() + V - 1); // Sort wall_pool[0] through wall_pool[V-2] (the V-1 internal walls we use)
-        } else {
-            // TODO: load from a txt file
+    // not tested
+    void update_pools(const std::string& s) {
+        // Parse readable config format: "3Bb | 0Ab | 0Bc | ..."
+        // we only have limited knowledge of wall_pool's first several elements, fill the rest with unique position then
+        pool.clear();
+        wall_pool.clear(); 
+        
+        // Split by '|' to get vertices
+        std::vector<std::vector<std::string>> vertices;
+        size_t pos = 0;
+        
+        while (pos < s.length()) {
+            // Skip whitespace
+            while (pos < s.length() && (s[pos] == ' ' || s[pos] == '\n' || s[pos] == '\r' || s[pos] == '\t')) ++pos;
+            if (pos >= s.length()) break;
+            
+            // Find next '|' or end
+            size_t next_pipe = s.find('|', pos);
+            if (next_pipe == std::string::npos) next_pipe = s.length();
+            
+            // Extract vertex string
+            std::string vertex_str = s.substr(pos, next_pipe - pos);
+            
+            // Parse pins in this vertex
+            std::vector<std::string> pins;
+            std::stringstream pin_ss(vertex_str);
+            std::string pin_str;
+            
+            while (pin_ss >> pin_str) {
+                pins.push_back(pin_str);
+            }
+            
+            if (!pins.empty()) {
+                vertices.push_back(pins);
+            }
+            
+            pos = next_pipe + 1;
+        }
+        
+        // Reconstruct pool from parsed pins
+        for (const auto& vertex : vertices) {
+            for (const auto& pin_str : vertex) {
+                uint8_t pin;
+                if (pin_str == "Inp") {
+                    pin = INPUT;
+                } else {
+                    // Parse format: {idx}{poleChar}{pinChar}
+                    // e.g., "3Bb" -> idx=3, pole=B, pintype=b
+                    // Last char is pin type, second-to-last is pole, rest is idx
+                    uint8_t idx = static_cast<uint8_t>(std::stoi(pin_str.substr(0, pin_str.length() - 2)));
+                    char pole_char = pin_str[pin_str.length() - 2];
+                    char pin_char = pin_str[pin_str.length() - 1];
+                    
+                    PoleType pole = (pole_char == 'A') ? Pole1 : Pole2;
+                    PinType pin_type;
+                    if (pin_char == 'a') pin_type = Pin1;
+                    else if (pin_char == 'b') pin_type = Pin2;
+                    else pin_type = Disconnected;
+                    
+                    pin = encode_pin(pole, pin_type, idx);
+                }
+                pool.push_back(pin);
+            }
+        }
+        
+        // Reconstruct wall_pool from vertex boundaries
+        // wall_pool[i] is the position where vertex i+1 starts
+        size_t wall_pos = 1; // Start from position 1 (first internal wall)
+        for (size_t i = 0; i < vertices.size() - 1; ++i) {
+            wall_pos += vertices[i].size();
+            wall_pool.push_back(static_cast<uint8_t>(wall_pos));
         }
     }
 
@@ -397,59 +493,20 @@ private:
         return true; 
     }
 
-    template<typename T>
-    static std::string mask2string(T bitmask, int length) {
-        return std::bitset<sizeof(T) * 8>(bitmask).to_string().substr(sizeof(T) * 8 - length);
+    static void print_stats(Statistics stats) {
+        std::cout << "==================================================================Basic Parameters===================================================================" << std::endl;
+        std::cout << "#switch N: " << (int)stats.N << std::endl;
+        std::cout << "#output M: " << (int)stats.M << std::endl;
+        std::cout << "#vertex V: " << (int)stats.V << std::endl;
+        std::cout << "pool size: " << (int)stats.pool_size << std::endl;
+        std::cout << "Total tries: " << stats.total_generate_counter << std::endl;
+        std::cout << "Unique configurations: " << (int)stats.n_unique_configs << " (" << ((1<<stats.N) - (int)stats.n_unique_configs) << " removed)" << std::endl;
+        std::cout << "All reachable bitset: " << mask2string(stats.all_reachable_bitset, stats.V) << std::endl;
+        std::cout << "Never reached outputs: " << (int)stats.n_never_reached << std::endl;
+        std::cout << "Max n reachable: " << (int)stats.max_reachable_n << std::endl;
+        std::cout << "Max bitmask|reachable: " << mask2string(stats.max_reachable_bitmask, stats.N) << "|" << mask2string(stats.max_reachable_bitset, stats.V) << std::endl;
+        std::cout << "all bitmasks and reachables: " << std::endl;
+        std::cout << "hash value:" << stats.hash << std::endl;
+        std::cout << "=====================================================================================================================================================" << std::endl;
     }
-
-    static std::pair<int, std::vector<uint64_t>> findBestColumnRemoval(const rsa_t& rsa, int M, int C) {
-        int N = rsa.size();
-        int max_unique_rows = 0;
-        std::vector<uint64_t> best_removal_masks {};
-        uint64_t removal_mask = (1ULL << C) - 1;
-        const uint64_t limit = 1ULL << M;
-        
-        // Gosper's hack to iterate through all combinations of C columns to remove
-        while (removal_mask < limit) {
-            uint64_t keep_mask = (~removal_mask) & (limit - 1);
-            std::unordered_set<uint64_t> unique_rows;
-            for (const auto& [row, bitmask] : rsa) {
-                unique_rows.insert(row & keep_mask);
-            }
-            if (unique_rows.size() >= max_unique_rows) {
-                if (unique_rows.size() > max_unique_rows) {
-                    max_unique_rows = unique_rows.size();
-                    best_removal_masks.clear();
-                }
-                best_removal_masks.push_back(removal_mask);
-            }
-            // Gosper's hack to get the next combination of C bits
-            uint64_t c = removal_mask & -removal_mask;
-            uint64_t r = removal_mask + c;
-            removal_mask = (((r ^ removal_mask) >> 2) / c) | r;
-        }
-        return { max_unique_rows, best_removal_masks };
-    }
-
-    static std::vector<uint8_t> serialize_data(const SwitchBlackbox& bb) {
-        // serialize the data so I can save it for analysis
-        // N,M,V,pool_size,pool[0],...,pool[pool_size - 1],wall_pool.size(),wall_pool[0],...,wall_pool[wall_pool.size() - 2]
-        std::vector<uint8_t> serialized_data;
-        serialized_data.push_back(bb.N);
-        serialized_data.push_back(bb.M);
-        serialized_data.push_back(bb.V);
-        serialized_data.push_back(bb.pool_size);
-        for(int i = 0; i < serialized_data.back(); ++i) {
-            serialized_data.push_back(bb.pool[i]);
-        }
-        serialized_data.push_back(bb.wall_pool.size());
-        for(int i = 0; i < serialized_data.back(); ++i) {
-            serialized_data.push_back(bb.wall_pool[i]);
-        }
-        serialized_data.push_back(SPECIAL);
-        //some metrics
-
-        return serialized_data;
-    }
-
 };
