@@ -455,13 +455,31 @@ private:
             }
         }
         
+        assert(pool.size() == pool_size);
+        assert(vertices.size() == V);
+
         // Reconstruct wall_pool from vertex boundaries
-        // wall_pool[i] is the position where vertex i+1 starts
-        size_t wall_pos = 1; // Start from position 1 (first internal wall)
+        // wall_pool[i] is the pool index where vertex i+1 starts
+        size_t wall_pos = 0;
         for (size_t i = 0; i < vertices.size() - 1; ++i) {
             wall_pos += vertices[i].size();
             wall_pool.push_back(static_cast<uint8_t>(wall_pos));
         }
+
+        // Only the first V-1 walls affect topology; fill the rest like random generation does
+        for (uint8_t i = 1; i < pool_size; ++i) {
+            bool already_used = false;
+            for (uint8_t w : wall_pool) {
+                if (w == i) {
+                    already_used = true;
+                    break;
+                }
+            }
+            if (!already_used) {
+                wall_pool.push_back(i);
+            }
+        }
+        assert(wall_pool.size() == pool_size - 1);
     }
 
     static bool validate_constraints(const int N, const std::vector<uint8_t>& vertex_sizes, const p2v_t& p2v, const uint8_t input_vertex) {
