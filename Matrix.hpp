@@ -15,10 +15,10 @@ void keep_uniques(std::vector<T>& matrix) {
 }
 
 template <typename T>
-inline size_t uniqueness_sorted(std::vector<T>& vec) {
+inline size_t n_unique_sorted(const std::vector<T>& vec) {
     size_t duplicate_count = 0;
     for (int i = 0; i < vec.size() - 1; i++) {
-        if (arr[i] == arr[i + 1]) {
+        if (vec[i] == vec[i + 1]) {
             ++duplicate_count;
         }
     }
@@ -53,7 +53,6 @@ int n1s(const std::vector<T>& arr) { // number of bit1s
     return n1s;
 }
 
-// (pack_matrix and unpack_mask functions remain exactly the same as before)
 template<typename T>
 static std::vector<T> pack_matrix(const std::vector<T>& matrix, T allowed_mask) {
     std::vector<T> packed_matrix;

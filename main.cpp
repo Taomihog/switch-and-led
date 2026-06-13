@@ -9,8 +9,8 @@
 #include "SwitchBlackbox.hpp"
 
 struct opt_t {
-    int num_workers = 4;
-    int target_count = 20000;
+    int num_workers = -1;
+    int target_count = 1000;
 
     uint8_t N = 5; // Switches
     uint8_t M = 8; // Outputs
@@ -24,78 +24,76 @@ struct SharedState {
     uint32_t max_dist_2 = 0;
     int min_stdev = INT_MAX;
     int max_n1s = 0;
+    int min_n1s = INT_MAX;
+    std::string s_max_dist_adj;
+    std::string s_max_dist_2;
+    std::string s_min_stdev;
+    std::string s_max_n1s;
+    std::string s_min_n1s;
 };
 
-void worker(const opt_t& opt, SharedState& shared) {
+void worker(const opt_t& opt, SharedState& shared, int id) {
     SwitchBlackbox sbb(opt.N, opt.M, opt.V);
     const int full_unique = 1 << opt.N;
 
-    while (shared.cnt.load(std::memory_order_relaxed) < opt.target_count) {
+    while (shared.cnt.fetch_add(1, std::memory_order_relaxed) < opt.target_count) {
         SwitchBlackbox::Statistics s;
         do {
             sbb.generate();
-            s = sbb.basic_stats();
-        } while (s.max_reachable_n < opt.M);
-
-        if (sbb.best_choice_of_m_vertices() != full_unique) {
-            continue;
-        }
-
-        auto dist_1 = sbb.sum_reachable_distance_for_adjacent_bitmasks(1, opt.V);
-        auto dist_2 = sbb.sum_reachable_distance_for_adjacent_bitmasks(2, opt.V);
-        auto n1s = sbb.n_1s();
-        auto stdev = sbb.stdev();
-
+        } while(!sbb.filter());
         std::lock_guard<std::mutex> lock(shared.mtx);
-        if (shared.cnt >= opt.target_count) {
-            break;
-        }
-
-        bool good = false;
-        if (dist_2 > shared.max_dist_2) {
-            good = true;
-            shared.max_dist_2 = dist_2;
-        }
-        if (dist_1 > shared.max_dist_adj) {
-            good = true;
-            shared.max_dist_adj = dist_1;
-        }
-        if (n1s > shared.max_n1s) {
-            good = true;
-            shared.max_n1s = n1s;
-        }
-        if (stdev < shared.min_stdev || stdev == 0) {
-            good = true;
-            shared.min_stdev = stdev;
-        }
-
-        if (good) {
-            std::string config = sbb.get_readable_config();
-            std::cout << "Unique config: " << full_unique << ", config: " << config;
-            std::cout << "distance 1: " << dist_1 << ", distance 2: " << dist_2
-                      << ", n1s:" << n1s << ", stdev: " << stdev << std::endl;
-
-            sbb.generate(sbb.get_readable_config());
-            if (config != sbb.get_readable_config()) {
-                std::cerr << "error!" << std::endl;
-            }
-        }
-
-        ++shared.cnt;
+        std::vector<size_t> fc = sbb.fc;
+        std::cout << "Core id:" << id << std::endl;
+        std::cout << "fc: " << fc[0] << " " << fc[1] << " " << fc[2] << " " << fc[3] << " " << fc[4] << " " << std::endl;
+        s = sbb.find_best();
     }
 }
 
 int main() {
     SharedState shared;
     std::vector<std::thread> threads;
+    // unsigned int cores = 1;
+    unsigned int cores = std::thread::hardware_concurrency();
+    std::cout << "#cores: " << cores << std::endl;
+    if (cores == 1) {
+        //debug mode:
+        std::cout << "debug mode" << std::endl;
+        worker(opt, shared, 0);
+        return 0;
+    }
+    
+    opt.num_workers = cores - 1;
     threads.reserve(opt.num_workers);
 
     for (int i = 0; i < opt.num_workers; ++i) {
-        threads.emplace_back(worker, std::cref(opt), std::ref(shared));
+        threads.emplace_back(worker, std::cref(opt), std::ref(shared), i);
     }
     for (auto& t : threads) {
         t.join();
     }
+    
+    // SwitchBlackbox sbb(opt.N, opt.M, opt.V);
+    // sbb.verbose = 1;
+
+    // std::cout << std::endl << "Max Distance " << std::endl;
+    // sbb.generate(shared.s_max_dist_adj);
+    // sbb.basic_stats();
+    
+    // std::cout << std::endl << "Max Distance 2" << std::endl;
+    // sbb.generate(shared.s_max_dist_2);
+    // sbb.basic_stats();
+    
+    // std::cout << std::endl << "Min StDev" << std::endl;
+    // sbb.generate(shared.s_min_stdev);
+    // sbb.basic_stats();
+    
+    // std::cout << std::endl << "Max N of bit1" << std::endl;
+    // sbb.generate(shared.s_max_n1s);
+    // sbb.basic_stats();
+    
+    // std::cout << std::endl << "Min N of bit1" << std::endl;
+    // sbb.generate(shared.s_min_n1s);
+    // sbb.basic_stats();
 
     return 0;
 }
