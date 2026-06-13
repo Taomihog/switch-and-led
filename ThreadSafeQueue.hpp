@@ -1,64 +1,56 @@
-#pragma once
+#include <iostream>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <thread>
+#include <fstream>
+#include <string>
 #include <optional>
 
+// A basic Thread-Safe Blocking Queue implementation
 template <typename T>
-class ThreadSafeQueue {
+class BlockingQueue {
 private:
-    std::queue<T> raw_queue;
-    mutable std::mutex mtx;
-    std::condition_variable cv;
+    std::queue<T> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool done_ = false; // Flag to indicate production is finished
 
 public:
-    ThreadSafeQueue() = default;
-    
-    // Prevent copying to avoid resource management conflicts
-    ThreadSafeQueue(const ThreadSafeQueue&) = delete;
-    ThreadSafeQueue& operator=(const ThreadSafeQueue&) = delete;
-
-    // Push an item into the queue
+    // Push an item into the queue and notify the waiting thread
     void push(T value) {
         {
-            std::lock_guard<std::mutex> lock(mtx);
-            raw_queue.push(std::move(value));
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push(std::move(value));
         }
-        cv.notify_one(); // Wake up one waiting consumer thread
+        cv_.notify_one(); // Wake up the write thread
     }
 
-    // Block until an item is available and pop it
-    T pop_blocking() {
-        std::unique_lock<std::mutex> lock(mtx);
-        // Lambdas guard against spurious wakeups
-        cv.wait(lock, [this]() { return !raw_queue.empty(); });
+    // Blocks until an item is available or the queue is shut down
+    std::optional<T> pop() {
+        std::unique_lock<std::mutex> lock(mutex_);
         
-        T value = std::move(raw_queue.front());
-        raw_queue.pop();
-        return value;
-    }
+        // Wait until the queue has elements OR we are shutting down
+        cv_.wait(lock, [this]() { 
+            return !queue_.empty() || done_; 
+        });
 
-    // Try to pop immediately without blocking
-    std::optional<T> try_pop() {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (raw_queue.empty()) {
+        // If queue is empty and we are shutting down, return empty optional
+        if (queue_.empty() && done_) {
             return std::nullopt;
         }
-        
-        T value = std::move(raw_queue.front());
-        raw_queue.pop();
+
+        T value = std::move(queue_.front());
+        queue_.pop();
         return value;
     }
 
-    // Check if the queue is empty (result is ephemeral)
-    bool empty() const {
-        std::lock_guard<std::mutex> lock(mtx);
-        return raw_queue.empty();
-    }
-
-    // Get the current size of the queue
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mtx);
-        return raw_queue.size();
+    // Gracefully shut down the queue
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+        }
+        cv_.notify_all(); // Wake up any thread stuck in pop()
     }
 };

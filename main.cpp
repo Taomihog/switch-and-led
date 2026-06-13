@@ -7,6 +7,7 @@
 #include <climits>
 
 #include "SwitchBlackbox.hpp"
+#include "ThreadSafeQueue.hpp"
 
 struct opt_t {
     int num_workers = -1;
@@ -32,7 +33,7 @@ struct SharedState {
     std::string s_min_n1s;
 };
 
-void worker(const opt_t& opt, SharedState& shared, int id) {
+void worker(const opt_t& opt, SharedState& shared, int id, BlockingQueue<std::string>& queue) {
     SwitchBlackbox sbb(opt.N, opt.M, opt.V);
     const int full_unique = 1 << opt.N;
 
@@ -45,11 +46,43 @@ void worker(const opt_t& opt, SharedState& shared, int id) {
         std::vector<size_t> fc = sbb.fc;
         std::cout << "Core id:" << id << std::endl;
         std::cout << "fc: " << fc[0] << " " << fc[1] << " " << fc[2] << " " << fc[3] << " " << fc[4] << " " << std::endl;
-        s = sbb.find_best();
+        s = sbb.find_best(true);
+        const std::string config_str = sbb.get_readable_config();
+        queue.push(config_str);
     }
 }
 
+// The worker function executed by the write thread
+void writer(BlockingQueue<std::string>& queue, const std::string& filename) {
+    std::ofstream outFile(filename, std::ios::out | std::ios::app);
+    if (!outFile) {
+        std::cerr << "Error opening file: " << filename << std::endl;
+        return;
+    }
+
+    while (true) {
+        // Blocks here waiting for data
+        std::optional<std::string> item = queue.pop();
+        
+        // If pop() returns nullopt, the queue is shutting down and empty
+        if (!item.has_value()) {
+            break; 
+        }
+
+        // Write the data safely to the file
+        outFile << item.value() << std::endl;;
+    }
+    
+    outFile.close();
+    std::cout << "Writing complete. Thread joined safely." << std::endl;
+}
+
 int main() {
+
+    BlockingQueue<std::string> logQueue;
+    std::string filename = "output.txt";
+    std::thread writerThread(writer, std::ref(logQueue), std::ref(filename));
+
     SharedState shared;
     std::vector<std::thread> threads;
     // unsigned int cores = 1;
@@ -58,42 +91,21 @@ int main() {
     if (cores == 1) {
         //debug mode:
         std::cout << "debug mode" << std::endl;
-        worker(opt, shared, 0);
+        worker(opt, shared, 0, logQueue);
         return 0;
     }
     
-    opt.num_workers = cores - 1;
+    opt.num_workers = cores - 2;
     threads.reserve(opt.num_workers);
 
     for (int i = 0; i < opt.num_workers; ++i) {
-        threads.emplace_back(worker, std::cref(opt), std::ref(shared), i);
+        threads.emplace_back(worker, std::cref(opt), std::ref(shared), i, std::ref(logQueue));
     }
     for (auto& t : threads) {
         t.join();
     }
-    
-    // SwitchBlackbox sbb(opt.N, opt.M, opt.V);
-    // sbb.verbose = 1;
-
-    // std::cout << std::endl << "Max Distance " << std::endl;
-    // sbb.generate(shared.s_max_dist_adj);
-    // sbb.basic_stats();
-    
-    // std::cout << std::endl << "Max Distance 2" << std::endl;
-    // sbb.generate(shared.s_max_dist_2);
-    // sbb.basic_stats();
-    
-    // std::cout << std::endl << "Min StDev" << std::endl;
-    // sbb.generate(shared.s_min_stdev);
-    // sbb.basic_stats();
-    
-    // std::cout << std::endl << "Max N of bit1" << std::endl;
-    // sbb.generate(shared.s_max_n1s);
-    // sbb.basic_stats();
-    
-    // std::cout << std::endl << "Min N of bit1" << std::endl;
-    // sbb.generate(shared.s_min_n1s);
-    // sbb.basic_stats();
+    logQueue.shutdown();  // Signal the write thread that no more data is coming
+    writerThread.join();  // Wait for the write thread to finish writing remaining items
 
     return 0;
 }

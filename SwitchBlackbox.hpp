@@ -58,7 +58,6 @@ public:
                     if (pos2vertex[i] != pos2vertex[i + 1]) ss << "| ";
                 }
             }
-            ss << std::endl;
         } else {
             ss << "pins in pool:      ";
             for (size_t i = 0; i < pool.size(); ++i) {
@@ -214,7 +213,7 @@ public:
         stats.pool_size = pool_size;
         stats.hash = serialized_hash();
 
-        if (1) {
+        if (verbose) {
             std::cout << "=========Basic Parameters==========" << std::endl;
             std::cout << "#switch N: " << (int)stats.N << std::endl;
             std::cout << "#output M: " << (int)stats.M << std::endl;
@@ -234,7 +233,7 @@ public:
                     std::cout << std::endl;
                 }
             }
-            std::cout << std::endl << "#bit masks:" << best_masks.size() << std::endl;
+            std::cout << std::endl << "#best masks:" << best_masks.size() << std::endl;
         }
         // check for each best_mask and find good parameters
         // shrink matrix
@@ -423,6 +422,81 @@ private:
         assert(wall_pool.size() == pool_size - 1);
     }
 
+    static uint8_t word2uint8(std::string pin_str) {
+        assert(pin_str.length() == 3);
+        uint8_t pin;
+        if (pin_str == "Inp") {
+            pin = INPUT;
+        } else {
+            // Parse format: {idx}{poleChar}{pinChar}
+            // e.g., "3Bb" -> idx=3, pole=B, pintype=b
+            // Last char is pin type, second-to-last is pole, rest is idx
+            uint8_t idx = static_cast<uint8_t>(std::stoi(pin_str.substr(0, pin_str.length() - 2)));
+            char pole_char = pin_str[pin_str.length() - 2];
+            char pin_char = pin_str[pin_str.length() - 1];
+            
+            PoleType pole = (pole_char == 'A') ? Pole1 : Pole2;
+            PinType pin_type;
+            if (pin_char == 'a') pin_type = Pin1;
+            else if (pin_char == 'b') pin_type = Pin2;
+            else pin_type = Disconnected;
+            
+            pin = encode_pin(pole, pin_type, idx);
+        }
+        return pin;
+    }
+
+    void load_pools_from_string_unused(const std::string& input) {
+        // text: (5, 8, 15) 4Ab 0Aa Inp 4Bc 0Ba 1Bb 2Ac 1Ac 4Ba | Walls: 1, 2, 6, 9
+        pool.clear();
+        wall_pool.clear();
+
+        // 1. Isolate the Walls metadata from the main data stream
+        size_t wall_marker = input.find("| Walls:");
+        std::string data_part = input.substr(0, wall_marker);
+        
+        // 2. Parse the (v1, v2, v3) tuple from the beginning
+        std::stringstream data_ss(data_part);
+        char discard; // To skip '(', ')', and ','
+        int v1, v2, v3;
+        
+        if (data_ss >> discard >> v1 >> discard >> v2 >> discard >> v3 >> discard) {
+            assert (N == static_cast<uint8_t>(v1) || M == static_cast<uint8_t>(v2) || V == static_cast<uint8_t>(v3));
+        }
+
+        // 3. Parse all the words sequentially (No pipe checks needed!)
+        std::string word;
+        while (data_ss >> word) {
+            pool.push_back(word2uint8(word));
+        }
+
+        // 4. Parse the wall indices from the trailing portion
+        if (wall_marker != std::string::npos) {
+            std::string wall_part = input.substr(wall_marker + 8); // Skip "| Walls:"
+            std::stringstream wall_ss(wall_part);
+            int wall_idx;
+            
+            while (wall_ss >> wall_idx) {
+                wall_pool.push_back(wall_idx);
+                wall_ss >> discard; // Absorb the trailing comma
+            }
+        }
+
+        for (uint8_t i = 1; i < pool_size; ++i) {
+            bool already_used = false;
+            for (uint8_t w : wall_pool) {
+                if (w == i) {
+                    already_used = true;
+                    break;
+                }
+            }
+            if (!already_used) {
+                wall_pool.push_back(i);
+            }
+        }
+        assert(wall_pool.size() == pool_size - 1);
+    }
+    
     static bool validate_constraints(const int N, const std::vector<uint8_t>& vertex_sizes, const p2v_t& p2v, const uint8_t input_vertex) {
         // power vertex size must > 1
         if (vertex_sizes[input_vertex] <= 1) {
@@ -487,4 +561,6 @@ private:
 
         return hash_value;
     }
+
+
 };
